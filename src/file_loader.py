@@ -30,49 +30,208 @@ def load_file(path: str, sheet_name=None):
 
 
 # ---------------------------------------------------------------------------
-# PDF
+# PDF — three-strategy cascade
 # ---------------------------------------------------------------------------
+#
+# Root causes of the reported bugs:
+#
+# 1. Borderless PDFs (most common in Israeli invoice software):
+#    pdfplumber's default extract_tables() needs line/border elements to split
+#    columns. Without them it returns every row as a single merged cell.
+#    Fix: fall back to word-position-based column detection (_strategy_words).
+#
+# 2. עמודה_N generic column names:
+#    The first row of a detected table was all-empty (spacer / background row).
+#    The old code accepted it as the header and filled gaps with עמודה_N.
+#    Fix: skip all-empty rows while scanning for the first real header row.
+#
+# 3. Multi-page tables:
+#    Repeated header rows on subsequent pages were not always skipped.
+#    Fix: both strategies normalise repeated header rows.
+#
+# OCR hook point: replace or extend _load_pdf for scanned PDFs.
+# ---------------------------------------------------------------------------
+
+_MIN_COLS = 2          # fewer columns than this → extraction considered failed
+_MIN_GAP  = 8          # points of horizontal whitespace that marks a column break
+
 
 def _load_pdf(path: str) -> pd.DataFrame:
     """
-    Extract tables from every page using pdfplumber and merge into one DataFrame.
-    If no tables are found, raises a friendly FileLoadError (OCR hook point).
+    Try three strategies in order; return the first acceptable result.
+    Raises FileLoadError if all strategies fail.
     """
-    header = None
+    with pdfplumber.open(path) as pdf:
+        # Strategy 1: border/line-based (fast; works when PDF has explicit gridlines)
+        df = _strategy_border(pdf)
+        if _is_usable(df):
+            return df
+
+        # Strategy 2: word-position-based (works for borderless tables)
+        df = _strategy_words(pdf)
+        if _is_usable(df):
+            return df
+
+    raise FileLoadError(
+        "לא ניתן לזהות טבלה בקובץ ה-PDF.\n\n"
+        "ייתכן שמדובר ב-PDF סרוק הדורש זיהוי תווים (OCR),\n"
+        "או שהקובץ אינו מכיל טבלה בפורמט הנתמך.\n"
+        "נסה לייצא את הקובץ לאקסל ולהעלות אותו במקום."
+    )
+
+
+def _is_usable(df) -> bool:
+    """Return True when df looks like a real data table."""
+    if df is None or df.empty:
+        return False
+    if len(df.columns) < _MIN_COLS:
+        return False
+    # At least 30 % of cells across the first 10 rows should be non-empty.
+    sample = df.head(10)
+    total  = sample.size
+    filled = (sample != "").sum().sum()
+    return total > 0 and (filled / total) >= 0.30
+
+
+# ── Strategy 1: border-based ─────────────────────────────────────────────────
+
+def _strategy_border(pdf) -> pd.DataFrame:
+    header    = None
     data_rows = []
 
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            page_tables = page.extract_tables()
-            for table in page_tables:
-                if not table:
+    for page in pdf.pages:
+        for table in page.extract_tables():
+            if not table:
+                continue
+            for raw_row in table:
+                row = [str(c).strip() if c is not None else "" for c in raw_row]
+
+                if all(c == "" for c in row):
+                    continue                         # skip spacer / empty rows
+
+                if header is None:
+                    header = [c or f"עמודה_{j+1}" for j, c in enumerate(row)]
+                elif row == header:
+                    continue                         # skip repeated page headers
+                else:
+                    data_rows.append(row)
+
+    if header is None or not data_rows:
+        return None
+
+    return _build_df(header, data_rows)
+
+
+# ── Strategy 2: word-position-based ──────────────────────────────────────────
+
+def _strategy_words(pdf) -> pd.DataFrame:
+    """
+    Reconstruct table columns from the x-positions of words on each page.
+    Works for borderless tables where spacing alone separates columns.
+    """
+    col_breaks = None   # detected from the first (header) row
+    header     = None
+    data_rows  = []
+
+    for page in pdf.pages:
+        words = page.extract_words(
+            x_tolerance=3,
+            y_tolerance=3,
+            keep_blank_chars=False,
+            use_text_flow=False,
+        )
+        if not words:
+            continue
+
+        row_groups = _group_words_by_y(words, y_tolerance=4)
+
+        for word_row in row_groups:
+            if not word_row:
+                continue
+
+            if col_breaks is None:
+                # Use the first non-trivial row to set column structure.
+                if len(word_row) < _MIN_COLS:
                     continue
-                for row_idx, raw_row in enumerate(table):
-                    row = [str(c).strip() if c is not None else "" for c in raw_row]
-                    if header is None:
-                        # First non-empty row of first table becomes the header.
-                        header = [c if c else f"עמודה_{j + 1}" for j, c in enumerate(row)]
-                    else:
-                        # Skip rows that are an exact repeat of the header
-                        # (common when a table spans multiple pages).
-                        if row == header:
-                            continue
-                        data_rows.append(row)
+                col_breaks = _find_col_breaks(word_row, page.width)
+                if len(col_breaks) < _MIN_COLS + 1:
+                    col_breaks = None
+                    continue
 
-    if header is None:
-        raise FileLoadError(
-            "לא נמצאו טבלאות בקובץ ה-PDF.\n\n"
-            "ייתכן שמדובר ב-PDF סרוק הדורש זיהוי תווים (OCR).\n"
-            "במקרה זה, אנא המר את הקובץ לאקסל לפני ההעלאה."
-        )
+            row = _words_to_row(word_row, col_breaks)
 
-    if not data_rows:
-        raise FileLoadError(
-            "הטבלאות שנמצאו ב-PDF אינן מכילות שורות נתונים.\n"
-            "ודא שהקובץ מכיל טבלה עם לפחות שורת נתונים אחת."
-        )
+            if all(c == "" for c in row):
+                continue
 
-    # Normalise row widths to match the header length.
+            if header is None:
+                header = [c or f"עמודה_{j+1}" for j, c in enumerate(row)]
+            elif row == header:
+                continue                             # skip repeated page headers
+            else:
+                data_rows.append(row)
+
+    if header is None or not data_rows:
+        return None
+
+    return _build_df(header, data_rows)
+
+
+def _group_words_by_y(words: list, y_tolerance: int = 4) -> list:
+    """Cluster words into rows by their vertical (top) position."""
+    sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    rows, current, current_top = [], [sorted_words[0]], sorted_words[0]["top"]
+
+    for word in sorted_words[1:]:
+        if abs(word["top"] - current_top) <= y_tolerance:
+            current.append(word)
+        else:
+            rows.append(sorted(current, key=lambda w: w["x0"]))
+            current, current_top = [word], word["top"]
+
+    rows.append(sorted(current, key=lambda w: w["x0"]))
+    return rows
+
+
+def _find_col_breaks(header_words: list, page_width: float) -> list:
+    """
+    Identify column split positions from the gaps between header words.
+    Returns a list of x-coordinates that bound each column:
+    [left_edge, break1, break2, ..., right_edge]
+    """
+    sw = sorted(header_words, key=lambda w: w["x0"])
+    breaks = [0.0]
+
+    for i in range(len(sw) - 1):
+        gap_start = sw[i]["x1"]
+        gap_end   = sw[i + 1]["x0"]
+        if gap_end - gap_start >= _MIN_GAP:
+            breaks.append((gap_start + gap_end) / 2.0)
+
+    breaks.append(page_width)
+    return breaks
+
+
+def _words_to_row(word_row: list, breaks: list) -> list:
+    """Assign each word to its column bucket and join words within each bucket."""
+    n_cols = len(breaks) - 1
+    buckets = [[] for _ in range(n_cols)]
+
+    for word in word_row:
+        center = (word["x0"] + word["x1"]) / 2.0
+        idx = n_cols - 1
+        for i in range(n_cols):
+            if breaks[i] <= center < breaks[i + 1]:
+                idx = i
+                break
+        buckets[idx].append(word["text"])
+
+    return [" ".join(ws) for ws in buckets]
+
+
+# ── Shared helper ─────────────────────────────────────────────────────────────
+
+def _build_df(header: list, data_rows: list) -> pd.DataFrame:
+    """Normalise row widths and return a DataFrame."""
     n = len(header)
     normalised = []
     for row in data_rows:
@@ -81,7 +240,6 @@ def _load_pdf(path: str) -> pd.DataFrame:
         elif len(row) > n:
             row = row[:n]
         normalised.append(row)
-
     return pd.DataFrame(normalised, columns=header)
 
 
