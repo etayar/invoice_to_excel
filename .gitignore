@@ -30,3 +30,10 @@ desktop.ini
 
 # Output files (don't commit generated Excel exports)
 output*.xlsx
+
+# Local test files — may contain private business data, never commit
+local_test_files/
+*.pdf
+
+# Debug output from PDF extraction
+debug_output/
