@@ -19,7 +19,7 @@ if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
 
 from src.file_loader import load_file, FileLoadError
-from src.mapper import TARGET_COLUMNS, NO_MAP_OPTION, apply_mapping
+from src.mapper import TARGET_COLUMNS, NO_MAP_OPTION, apply_mapping, validate_mapping
 from src.exporter import export_to_excel
 
 # ---------------------------------------------------------------------------
@@ -183,6 +183,20 @@ class App(tk.Tk):
             return
 
         mapping = {t: v.get() for t, v in self.mapping_vars.items()}
+
+        # Validate and warn — but always let the user continue.
+        warnings = validate_mapping(self.source_df, mapping)
+        if warnings:
+            bullet_list = "\n".join(f"  • {w}" for w in warnings)
+            proceed = messagebox.askyesno(
+                "אזהרה לפני ייצוא",
+                f"נמצאו בעיות במיפוי:\n\n{bullet_list}\n\n"
+                "ייתכן שחלק מהנתונים יהיו ריקים בקובץ המיוצא.\n"
+                "האם ברצונך להמשיך בכל זאת?",
+                icon="warning",
+            )
+            if not proceed:
+                return
 
         save_path = filedialog.asksaveasfilename(
             title="שמור קובץ אקסל",
