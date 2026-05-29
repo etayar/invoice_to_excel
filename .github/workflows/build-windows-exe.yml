@@ -1,0 +1,40 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build executable
+        run: >
+          pyinstaller --onefile --windowed --name InvoiceToExcel
+          --hidden-import=pdfplumber
+          --hidden-import=pdfminer
+          --hidden-import=pdfminer.high_level
+          --hidden-import=pdfminer.layout
+          --hidden-import=openpyxl
+          --hidden-import=pandas
+          --hidden-import=xlrd
+          app.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InvoiceToExcel-windows
+          path: dist/InvoiceToExcel.exe
+          if-no-files-found: error
